@@ -1,0 +1,349 @@
+from pybricks.hubs import PrimeHub
+from pybricks.pupdevices import Motor, ColorSensor, UltrasonicSensor
+from pybricks.parameters import Button, Color, Direction, Port, Side, Stop
+from pybricks.robotics import DriveBase
+from pybricks.tools import wait, run_task
+
+
+#========================================
+#CONSTANTES E VARIÁVEIS GLOBAIS
+#========================================
+#HUB
+hub= PrimeHub()
+
+#Motores
+MTE = Motor(Port.A, Direction.COUNTERCLOCKWISE) #Motor esquerdo
+MTD = Motor(Port.B, Direction.CLOCKWISE) #Motor direito
+#MTG = Motor(Port.C, Direction.CLOCKWISE) #Motor garra
+
+#Sensores
+SE = ColorSensor(Port.D) #Sensor de cor esquerdo
+SD = ColorSensor(Port.E) #Sensor de cor direito
+SF = ColorSensor(Port.F) #Sensor de cor frontal
+
+#Base de condução
+DR = 56  # Ajuste este valor para o diâmetro real da sua roda
+AT = 163     # Ajuste este valor para a distância real entre as rodas
+drive_base = DriveBase(MTE, MTD, DR, AT)
+
+
+
+#PID - Parametros padrão para Gyro Turn
+pid_p = 3.30
+pid_i = 0.002
+pid_d = 0.016
+
+#PID - Parametros para Seguidor de Linhas
+pid_p_seg = 2.8
+pid_i_seg = 0.08
+pid_d_seg = 1.4
+
+#variáveis globais - PID
+erro = 0
+correcao = 0
+integral = 0
+derivada = 0
+erro_final = 0
+velocidade = 80  # Velocidade padrão do seguidor
+fator_calibracao = 1.0
+
+#variáveis globais - Sensores de Linha
+erro_esquerda = 0
+erro_direita = 0
+erro_sensor = 0
+integral_sensor = 0
+derivada_sensor = 0
+erro_final_sensor = 0
+
+#Calibração de Sensores (valores de reflexão)
+REFLEXAO_LINHA_ESQUERDA = 15
+REFLEXAO_FUNDO_ESQUERDA = 85
+REFLEXAO_LINHA_DIREITA = 15
+REFLEXAO_FUNDO_DIREITA = 85
+REFLEXAO_LINHA_FRONTAL = 15
+REFLEXAO_FUNDO_FRONTAL = 85
+REFLEXAO_TARGET = 50  # Meta de reflexão para sensor frontal
+
+#Limites e Tolerâncias
+GYRO_TOL = 0.05
+GYRO_MIN = 30
+GYRO_MAX = 60
+ERRO_MAX_SENSOR = 100
+VEL_MIN_SEG = 30
+VEL_MAX_SEG = 100
+#==========================================
+
+
+async def redefinir_pid():
+    global erro, correcao, integral, derivada, erro_final
+    erro = 0
+    correcao = 0
+    integral = 0
+    derivada = 0
+    erro_final = 0
+    await wait(0)
+
+async def redefinir_sensor():
+    global integral_sensor, derivada_sensor, erro_final_sensor, erro_sensor
+    integral_sensor = 0
+    derivada_sensor = 0
+    erro_final_sensor = 0
+    erro_sensor = 0
+    await wait(0)
+
+async def PID(kp, ki, kd):
+    global integral, derivada, correcao, erro_final
+    integral = integral + erro
+    if integral > 500:
+        integral = 500
+    if integral < -500:
+        integral = -500
+    derivada = erro - erro_final
+    correcao = (erro * kp) + (integral * ki) + (derivada * kd)
+    erro_final = erro
+    await wait(0)
+
+async def redefinir():
+    global erro, correcao, integral, derivada, erro_final, velocidade
+    await wait(0)
+    erro_final = 0
+    integral = 0
+    derivada = 0
+    correcao = 0
+    erro = 0
+
+
+
+
+async def GT(graus):
+    """
+    Gyro Turn - Gira o robô para um ângulo específico.
+
+    Args:
+        graus: Ângulo alvo em graus (0-360)
+    """
+    integral = 0
+    correcao = 0
+    erro_final = 0
+
+    kp = 3.30
+    ki = 0.002
+    kd = 0.016
+
+    print(f"\n[GT] Iniciando rotação para {graus}°...")
+    hub.imu.reset_heading(0)
+    alvo = graus
+
+    def erro_angular(alvo, atual):
+        return ((alvo - atual + 540) % 360) - 180
+
+    erro = erro_angular(alvo, hub.imu.heading())
+    iteracoes = 0
+
+    while abs(erro) > GYRO_TOL:
+        iteracoes += 1
+        # Cálculo PID inline para GT
+        integral += erro
+        integral = max(-500, min(500, integral))
+        derivada = erro - erro_final
+        correcao = (erro * kp) + (integral * ki) + (derivada * kd)
+        erro_final = erro
+
+        potencia = int(min(GYRO_MAX, max(GYRO_MIN, abs(correcao))))
+        if erro > 0:
+            MTD.dc(-potencia)
+            MTE.dc(potencia)
+        else:
+            MTD.dc(potencia)
+            MTE.dc(-potencia)
+
+        erro = erro_angular(alvo, hub.imu.heading())
+        await wait(10)
+
+    MTD.brake()
+    MTE.brake()
+
+    # Correção fina
+    erro_residual = erro_angular(alvo, hub.imu.heading())
+    if abs(erro_residual) > 0.2:
+        pulso_pot = 5
+        if erro_residual > 0:
+            MTD.dc(pulso_pot)
+            MTE.dc(-pulso_pot)
+        else:
+            MTD.dc(-pulso_pot)
+            MTE.dc(pulso_pot)
+        await wait(50)
+        MTD.brake()
+        MTE.brake()
+
+    print(f"[GT] ✅ Rotação concluída ({iteracoes} iter). Heading: {hub.imu.heading():.1f}°")
+
+async def GM(rotacoes, velocidade_final, angle, reverso=False):
+    global erro, correcao
+    await redefinir_pid()
+
+    print("GM iniciado - rotacoes:", rotacoes, "velocidade:", velocidade_final)
+
+    # Reset dos dois motores (importante quando usamos média)
+    MTE.reset_angle(0)
+    MTD.reset_angle(0)
+    await wait(0)
+
+    alvo_heading = angle
+    rotacoes_corrigidas = rotacoes * fator_calibracao
+
+    # Configuração de aceleração
+    velocidade_final = abs(velocidade_final)
+    velocidade_atual = 40
+    incremento = 2
+    desacelera_a_partir = 0.8 * abs(rotacoes_corrigidas)
+
+    sinal = -1 if reverso else 1
+    corr_sinal = -1 if reverso else 1
+
+    # Inicia movimento
+    MTE.dc(sinal * (velocidade_atual - corr_sinal * correcao))
+    MTD.dc(sinal * (velocidade_atual + corr_sinal * correcao))
+
+    while True:
+        # usa a média dos dois motores
+        rot_atual_esq = abs(MTE.angle() / 360)
+        rot_atual_dir = abs(MTD.angle() / 360)
+        rot_media = (rot_atual_esq + rot_atual_dir) / 2
+
+        if rot_media >= abs(rotacoes_corrigidas):
+            break
+
+        erro = ((alvo_heading - hub.imu.heading() + 540) % 360) - 180
+
+        # PID (mesmo para frente e ré aqui)
+        await PID(8.9, 0.009, 0.05)
+
+        # Aqui USEI rot_media (antes estava rot_atual -> causava NameError)
+        if rot_media < 0.3 * abs(rotacoes_corrigidas):
+            if velocidade_atual < velocidade_final:
+                velocidade_atual += incremento
+        elif rot_media > desacelera_a_partir:
+            velocidade_atual -= incremento
+            if velocidade_atual < 50:
+                velocidade_atual = 50
+
+        if reverso:
+            pot_esq = sinal * (velocidade_atual - correcao)
+            pot_dir = sinal * (velocidade_atual + correcao)
+        else:
+            pot_esq = sinal * (velocidade_atual + correcao)
+            pot_dir = sinal * (velocidade_atual - correcao)
+
+        MTE.dc(pot_esq)
+        MTD.dc(pot_dir)
+
+        await wait(20)
+
+    MTE.brake()
+    MTD.brake()
+
+    # Correção fina de heading (igual à sua versão)
+    erro_residual = ((alvo_heading - hub.imu.heading() + 540) % 360) - 180
+    if abs(erro_residual) > 0.03:
+        pulso_pot = 20
+        pulso_tempo = 80
+        print(f"Corrigindo heading final: erro = {erro_residual:.2f}°")
+
+        if erro_residual > 0:
+            MTD.dc(-pulso_pot)
+            MTE.dc(pulso_pot)
+        else:
+            MTD.dc(pulso_pot)
+            MTE.dc(-pulso_pot)
+
+        await wait(pulso_tempo)
+        MTE.brake()
+        MTD.brake()
+
+    print("GM finalizado")
+
+
+async def SEG(vel_seg=80, kp_seg=2.8, ki_seg=0.08, kd_seg=1.4, tempo_max=10000, modo="dual"):
+    global integral_sensor, derivada_sensor, erro_final_sensor, erro_sensor
+
+    await redefinir_sensor()
+
+    if modo == "dual":
+        print("Iniciando Seguidor com sensores Esquerdo e Direito...")
+    else:
+        print("Iniciando Seguidor com sensor Frontal...")
+
+    tempo = 0
+
+    while True:
+        tempo = tempo + 1
+        if tempo > tempo_max:
+            break
+
+        if modo == "dual":
+            reflexao_esq = SE.reflection()
+            reflexao_dir = SD.reflection()
+            erro_sensor = reflexao_dir - reflexao_esq
+        else:
+            reflexao_frontal = SF.reflection()
+            erro_sensor = reflexao_frontal - REFLEXAO_TARGET
+
+        integral_sensor = integral_sensor + erro_sensor
+        if integral_sensor > 500:
+            integral_sensor = 500
+        if integral_sensor < -500:
+            integral_sensor = -500
+
+        derivada_sensor = erro_sensor - erro_final_sensor
+
+        correcao = (kp_seg * erro_sensor) + (ki_seg * integral_sensor) + (kd_seg * derivada_sensor)
+
+        if correcao > 100:
+            correcao = 100
+        if correcao < -100:
+            correcao = -100
+
+        erro_final_sensor = erro_sensor
+
+        vel_esq = vel_seg - correcao
+        vel_dir = vel_seg + correcao
+
+        if vel_esq > 100:
+            vel_esq = 100
+        if vel_esq < -100:
+            vel_esq = -100
+        if vel_dir > 100:
+            vel_dir = 100
+        if vel_dir < -100:
+            vel_dir = -100
+
+        MTE.dc(int(vel_esq))
+        MTD.dc(int(vel_dir))
+
+        await wait(20)
+
+    MTE.brake()
+    MTD.brake()
+    print("Seguidor finalizado")
+
+
+
+
+async def main():
+    print("Robo iniciando...")
+    print("Executando GM...")
+
+    # Escolha um modo:
+    # await SEG(vel_seg=80, tempo_max=5000, modo="dual")      # Sensores esquerdo/direito
+    # await SEG(vel_seg=80, tempo_max=5000, modo="frontal")   # Sensor frontal
+
+    await GM(2, 80, 0)
+
+    print("Esperando...")
+    await wait(500)
+
+    print("Robo parou")
+
+    run_task(main())
